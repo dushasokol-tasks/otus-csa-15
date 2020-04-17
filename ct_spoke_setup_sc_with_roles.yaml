@@ -1,0 +1,453 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Create Local portfolio from the AWS Shared Portfolio
+
+Parameters:
+  MasterPortfolio:
+    Type: String
+    Description: Copy/Paste the  MasterPortfolioId value from the previous stack
+    Default: port-1xxx5xxxx0xx3
+    AllowedPattern: 'port-[A-Za-z0-9-]{13}'
+    ConstraintDescription: Must start with port- followed 13 characters
+
+Resources:
+  LocalSpokePortfolio:
+    Type: 'AWS::ServiceCatalog::Portfolio'
+    Properties:
+      AcceptLanguage: en
+      Description: Local Spoke Portfolio for Self service databases list
+      DisplayName: Self Service Databases - Local Sample Portfolio
+      ProviderName: CCOE
+
+  IamRoleLambdaForSC:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSServiceCatalogAdminFullAccess
+        - arn:aws:iam::aws:policy/AWSOrganizationsFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  LambdaExecutePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt
+        - SCAssociateProductsToPortfoliosLambda
+        - Arn
+      Principal: 'cloudformation.amazonaws.com'
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  RandomLambdaExecutePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt
+        - GenerateRandomNumber
+        - Arn
+      Principal: 'cloudformation.amazonaws.com'
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  GetIAMRoleLambdaExecutePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt
+        - GenerateRandomNumber
+        - Arn
+      Principal: 'cloudformation.amazonaws.com'
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  GenerateRandomNumber:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: IamRoleLambdaForSC
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import cfnresponse
+          import random
+          import logging
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+          def handler(event, context):
+            randnum = str(random.randint(1111,9999))       
+            _ret = {}
+            _ret['Data'] = randnum
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, _ret, randnum)
+      Handler: index.handler
+      Runtime: python3.7
+      MemorySize: 128
+      Role: !GetAtt IamRoleLambdaForSC.Arn
+      Timeout: 10
+
+  SCAssociateProductsToPortfoliosLambda:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: IamRoleLambdaForSC
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import botocore
+          import os
+          import cfnresponse
+          import logging
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+          sc = boto3.client('servicecatalog')
+
+          def handler(event, context):
+            prtId = os.environ.get("PortfolioId")
+            lprtId = os.environ.get("LocalPortfolioId")
+            lcRoleArn = os.environ.get("LaunchRoleArn")
+            prdList = {}
+
+            try:
+              prdList = sc.search_products_as_admin(PortfolioId=prtId)['ProductViewDetails']
+            except:
+              LOGGER.error('INVALID Product List Found-{}'.format(prtId))
+
+            lcRole = '{"RoleArn" : "' + lcRoleArn + '"}'
+            eventType = event['RequestType']
+
+            if prdList:
+              for item in prdList:
+                prdId = item['ProductViewSummary']['ProductId']
+                LOGGER.info('Working on Product-id'.format(prdId))
+                if eventType == 'Delete':
+                  try:
+                    constList = sc.list_constraints_for_portfolio(PortfolioId=lprtId)['ConstraintDetails']
+                  except:
+                    LOGGER.error('UNABLE TO GET CONNSTRAINTS')
+                  for const in constList:
+                    try:
+                      sc.delete_constraint(Id=const['ConstraintId'])
+                    except:
+                      LOGGER.error('Constraint deletion:{}'.format(const))
+                  try:
+                    sc.disassociate_product_from_portfolio(ProductId=prdId, PortfolioId=lprtId)
+                  except:
+                    LOGGER.error('Disassociation:{}-{}'.format(prdId, lprtId))
+                else:
+                  try:
+                    LOGGER.info('Associating products - {}'.format(prdList))
+                    sc.associate_product_with_portfolio(ProductId=prdId, PortfolioId=lprtId, \
+                                                        SourcePortfolioId=prtId)
+                  except:
+                    LOGGER.error('Association:{}-{}-{}'.format(prdId, lprtId, prtId))
+
+                  try:
+                    sc.create_constraint(PortfolioId=lprtId, ProductId=prdId, Type='LAUNCH', \
+                                    Description=prdId+' Launch Constraint', Parameters=lcRole)
+                  except:
+                    LOGGER.error('Constraint creation:{}-{}-{}'.format(prdId, lprtId, lcRole))
+
+            response = sc.describe_portfolio(Id=lprtId)['PortfolioDetail']
+            del(response['CreatedTime'])
+            _ret = {}
+            _ret['Data'] = response
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, _ret, "CustomResourcePhysicalID")
+      Handler: index.handler
+      Runtime: python3.7
+      MemorySize: 128
+      Role: !GetAtt IamRoleLambdaForSC.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          PortfolioId: !Ref MasterPortfolio
+          LocalPortfolioId: !Ref LocalSpokePortfolio
+          LaunchRoleArn: !GetAtt PortfolioLaunchConstraintRole.Arn
+
+  GetIAMRoleNameLambda:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: IamRoleLambdaForSC
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import botocore
+          import os
+          import cfnresponse
+          import logging
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+          iam = boto3.client('iam')
+          sts = boto3.client('sts')
+          ScEndUser = 'AWSReservedSSO_AWSServiceCatalogEndUserAccess_'
+          acctAdmin = 'AWSReservedSSO_AWSAdministratorAccess_'
+
+          def handler(event, context):
+            roleList = []
+            adminRoleList = []
+            response = 'UNKNOWN_ROLE'
+
+            try:
+              accountId = sts.get_caller_identity()['Account']
+            except Exception as e:
+              LOGGER.error('Enable to get Account Id: {}'.format(e))
+              
+            try:
+              roleDict = iam.list_roles()['Roles']
+            except Exception as e:
+              LOGGER.error('ListRole Failed: {}'.format(e))
+
+            for r in roleDict:
+              if r['RoleName'].startswith(ScEndUser):
+                roleList.append(r['Arn'])
+              elif r['RoleName'].startswith(acctAdmin):
+                adminRoleList.append(r['Arn'])
+
+            if len(roleList) > 0:
+              response = str(roleList[-1])
+            elif len(adminRoleList) > 0:
+              response = str(adminRoleList[-1])
+            
+            _ret = {}
+            _ret['Data'] = response
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, _ret, response)
+      Handler: index.handler
+      Runtime: python3.7
+      MemorySize: 128
+      Role: !GetAtt IamRoleLambdaForSC.Arn
+      Timeout: 30
+ 
+  TriggerLambda:
+    Type: 'Custom::TriggerLambda'
+    DependsOn:
+      - SCAssociateProductsToPortfoliosLambda
+      - LambdaExecutePermission
+    Properties:
+      ServiceToken: !GetAtt
+        - SCAssociateProductsToPortfoliosLambda
+        - Arn
+
+  GetIAMRoleName:
+    Type: 'Custom::TriggerLambda'
+    DependsOn:
+      - GetIAMRoleNameLambda
+      - GetIAMRoleLambdaExecutePermission
+    Properties:
+      ServiceToken: !GetAtt
+        - GetIAMRoleNameLambda
+        - Arn
+
+  GenerateTagOne:
+    Type: 'Custom::TriggerLambda'
+    DependsOn:
+      - GenerateRandomNumber
+      - LambdaExecutePermission
+    Properties:
+      ServiceToken: !GetAtt
+        - GenerateRandomNumber
+        - Arn
+
+  GenerateTagTwo:
+    Type: 'Custom::TriggerLambda'
+    DependsOn:
+      - GenerateRandomNumber
+      - LambdaExecutePermission
+    Properties:
+      ServiceToken: !GetAtt
+        - GenerateRandomNumber
+        - Arn
+
+  GenerateTagThree:
+    Type: 'Custom::TriggerLambda'
+    DependsOn:
+      - GenerateRandomNumber
+      - LambdaExecutePermission
+    Properties:
+      ServiceToken: !GetAtt
+        - GenerateRandomNumber
+        - Arn
+
+  PortfolioLaunchConstraintRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "servicecatalog.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonElasticMapReduceFullAccess 
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess      
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+      Policies:
+        - PolicyName: "AllowProductLaunchMasterPolicy"
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: '*'
+                Effect: "Allow"
+                Action:
+                  # Permissions required for the provisioning of the database
+                  - rds:*
+                  - ec2:DescribeAccountAttributes
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSecurityGroupReferences
+                  - ec2:DescribeStaleSecurityGroups
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:UpdateSecurityGroupRuleDescriptionsIngress
+                  - ec2:UpdateSecurityGroupRuleDescriptionsEgress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:CreateTags
+                  # Permissions required by AWS Service Catalog to create stack                  
+                  - cloudformation:GetTemplateSummary
+                  - s3:GetObject
+              - Resource:
+                  - "arn:aws:cloudformation:*:*:stack/SC-*"
+                  - "arn:aws:cloudformation:*:*:changeSet/SC-*"
+                Effect: "Allow"
+                Action:
+                  # Permissions required by AWS Service Catalog to create stack  
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStacks
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:UpdateStack
+              - Resource: '*'
+                Effect: Allow
+                Action:                  
+                  - "servicecatalog:ListServiceActionsForProvisioningArtifact"
+                  - "servicecatalog:ExecuteprovisionedProductServiceAction"
+                  - "iam:ListRolePolicies"
+                  - "iam:ListPolicies"
+                  - "iam:CreateRole"
+                  - "iam:DeleteRole"
+                  - "iam:GetRole"
+                  - "iam:PassRole"
+                  - "iam:ListRoles"
+                  - "iam:CreateInstanceProfile"
+                  - "iam:DeleteInstanceProfile"
+                  - "iam:AddRoleToInstanceProfile"
+                  - "iam:RemoveRoleFromInstanceProfile"
+                  - "iam:DetachRolePolicy"
+                  - "iam:AttachRolePolicy"                                 
+                  - "cloudformation:DescribeStackResource"
+                  - "cloudformation:DescribeStackResources"
+                  - "cloudformation:GetTemplate"
+                  - "cloudformation:List*"
+                  - "cloudformation:DescribeStackEvents"
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:CreateStack"
+                  - "cloudformation:DeleteStack"
+                  - "cloudformation:DescribeStackEvents"
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:GetTemplateSummary"
+                  - "cloudformation:SetStackPolicy"
+                  - "cloudformation:ValidateTemplate"
+                  - "cloudformation:UpdateStack"     
+              - Resource: '*'
+                Effect: Allow
+                Action:                  
+                  - "servicecatalog:ListServiceActionsForProvisioningArtifact"
+                  - "servicecatalog:ExecuteprovisionedProductServiceAction"
+                  - "iam:AddRoleToInstanceProfile"
+                  - "iam:ListRolePolicies"
+                  - "iam:ListPolicies"
+                  - "iam:DeleteRole"
+                  - "iam:GetRole"
+                  - "iam:CreateInstanceProfile"
+                  - "iam:PassRole"
+                  - "iam:DeleteInstanceProfile"
+                  - "iam:ListRoles"
+                  - "iam:RemoveRoleFromInstanceProfile"
+                  - "iam:CreateRole"
+                  - "iam:DetachRolePolicy"
+                  - "iam:AttachRolePolicy"                                 
+                  - "cloudformation:DescribeStackResource"
+                  - "cloudformation:DescribeStackResources"
+                  - "cloudformation:GetTemplate"
+                  - "cloudformation:List*"
+                  - "cloudformation:DescribeStackEvents"
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:CreateStack"
+                  - "cloudformation:DeleteStack"
+                  - "cloudformation:DescribeStackEvents"
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:GetTemplateSummary"
+                  - "cloudformation:SetStackPolicy"
+                  - "cloudformation:ValidateTemplate"
+                  - "cloudformation:UpdateStack"               
+                  - "s3:GetObject"
+                
+  AssociateARole:
+    Type: "AWS::ServiceCatalog::PortfolioPrincipalAssociation"
+    Properties:
+      PrincipalARN: !Ref GetIAMRoleName
+      AcceptLanguage: en
+      PortfolioId: !Ref LocalSpokePortfolio
+      PrincipalType: IAM
+
+  EnvTagOptionOne:
+    Type: "AWS::ServiceCatalog::TagOption"
+    Properties:
+      Key: "Cost-Center"
+      Value: !Ref GenerateTagOne
+  
+  EnvTagOptionTwo:
+    Type: "AWS::ServiceCatalog::TagOption"
+    Properties:
+      Key: "Cost-Center"
+      Value: !Ref GenerateTagTwo
+
+  EnvTagOptionThree:
+    Type: "AWS::ServiceCatalog::TagOption"
+    Properties:
+      Key: "Cost-Center"
+      Value: !Ref GenerateTagThree
+
+  PortfolioTagOptionAssociationOne:
+    Type: "AWS::ServiceCatalog::TagOptionAssociation"
+    Properties:
+      ResourceId: !Ref LocalSpokePortfolio
+      TagOptionId: !Ref EnvTagOptionOne
+
+  PortfolioTagOptionAssociationTwo:
+    Type: "AWS::ServiceCatalog::TagOptionAssociation"
+    Properties:
+      ResourceId: !Ref LocalSpokePortfolio
+      TagOptionId: !Ref EnvTagOptionTwo
+
+  PortfolioTagOptionAssociationThree:
+    Type: "AWS::ServiceCatalog::TagOptionAssociation"
+    Properties:
+      ResourceId: !Ref LocalSpokePortfolio
+      TagOptionId: !Ref EnvTagOptionThree
+
+Outputs:
+  LocalPortfolioId:
+    Description: Local Portfolio Id 
+    Value: !Ref LocalSpokePortfolio
+  RemotePortfolioId:
+    Description: Shared Organizational Portfolio Id 
+    Value: !Ref MasterPortfolio
+  IAMRoleArn:
+    Description: IAM Role Arn 
+    Value: !Ref GetIAMRoleName
+
